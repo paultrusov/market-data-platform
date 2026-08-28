@@ -1,0 +1,39 @@
+# Three nodes: one control plane and two workers.
+#
+# The workers are labelled by role because the drills need to know what they are
+# killing. Postgres is pinned to the data node (its PersistentVolume is local to
+# that node and cannot follow it), so the node-kill drill always targets the
+# compute node, where only stateless work runs.
+#
+# node-monitor-grace-period is lowered from its 40s default: the drill measures how
+# fast a lost node's pods come back, and with the default the answer is dominated by
+# how long the control plane waits before it will admit the node is gone.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: mdp
+nodes:
+  - role: control-plane
+    # A NodePort is open on every node, but nothing on the host can reach it until
+    # kind maps the port through the node's container.
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
+      - containerPort: 30090
+        hostPort: 30090
+        protocol: TCP
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        controllerManager:
+          extraArgs:
+            - name: node-monitor-grace-period
+              value: "10s"
+            - name: node-monitor-period
+              value: "2s"
+  - role: worker
+    labels:
+      mdp.io/role: data
+  - role: worker
+    labels:
+      mdp.io/role: compute

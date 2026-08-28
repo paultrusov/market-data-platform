@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r ingest/requirements.txt pytest
+      - run: python -m pytest tests -q
+
+  lint-infra:
+    name: terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=infra init -backend=false
+      - run: terraform -chdir=infra fmt -check -diff
+      - run: terraform -chdir=infra validate
+
+  images:
+    name: build images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t mdp-ingest:ci ingest
+      - run: docker build -t mdp-replay:ci replay
+
+  e2e:
+    # The part that makes this a deploy pipeline rather than a build: a real three
+    # node cluster, the real Terraform, and a failure drill run against it. The feed
+    # is the synthetic one here -- CI should not go red because a public exchange
+    # endpoint was slow.
+    name: deploy to a real cluster and drill it
+    needs: [test, lint-infra, images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: create the cluster
+        uses: helm/kind-action@v1
+        with:
+          config: kind-config.yaml
+          cluster_name: mdp
+
+      - name: build and side-load images
+        run: |
+          docker build -t mdp-ingest:ci ingest
+          docker build -t mdp-replay:ci replay
+          kind load docker-image mdp-ingest:ci mdp-replay:ci --name mdp
+
+      - name: deploy
+        run: |
+          terraform -chdir=infra init -input=false
+          terraform -chdir=infra apply -auto-approve \
+            -var image_tag=ci -var ingest_source=synthetic
+
+      - name: wait for the rollout
+        run: |
+          kubectl -n mdp rollout status statefulset/postgres  --timeout=300s
+          kubectl -n mdp rollout status deployment/ingest     --timeout=300s
+          kubectl -n mdp rollout status deployment/replay     --timeout=300s
+          kubectl -n mdp rollout status deployment/prometheus --timeout=300s
+
+      - name: smoke test the replay API
+        run: |
+          for i in $(seq 1 30); do
+            total=$(curl -sf http://localhost:30080/stats | python3 -c 'import sys,json;print(json.load(sys.stdin)["total"])' || echo 0)
+            echo "ticks stored: $total"
+            [ "$total" -gt 0 ] && break
+            sleep 2
+          done
+          [ "$total" -gt 0 ] || { echo "no data was ingested"; exit 1; }
+          curl -sf "http://localhost:30080/replay?symbol=BTC-USD&minutes=5&speed=0" | head -3
+
+      - name: prometheus is scraping both tiers
+        run: |
+          curl -sf 'http://localhost:30090/api/v1/targets?state=active' \
+            | python3 -c 'import sys,json; t=json.load(sys.stdin)["data"]["activeTargets"]; assert t and all(x["health"]=="up" for x in t), t; print(len(t), "targets up")'
+
+      - name: pod-kill drill
+        run: python3 drills/pod_kill.py
+
+      - name: dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n mdp get pods -o wide
+          kubectl -n mdp describe pods
+          kubectl -n mdp logs -l app=ingest --tail=100 --prefix || true
