@@ -50,6 +50,11 @@ jobs:
       - name: create the cluster
         uses: helm/kind-action@v1
         with:
+          # Pinned deliberately. The action's default kind is older, and its kubeadm
+          # config API (v1beta3) wants `extraArgs` as a map where v1beta4 wants a list
+          # -- so an unpinned runner rejects the same kind-config.yaml that works
+          # locally, with an unmarshal error that says nothing about versions.
+          version: v0.33.0
           config: kind-config.yaml
           cluster_name: mdp
 
