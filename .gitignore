@@ -2,6 +2,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 infra/.terraform/
-infra/.terraform.lock.hcl
 infra/terraform.tfstate*
 .venv/
